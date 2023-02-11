@@ -126,7 +126,11 @@ def flatten(outputs, device, path="", metadata=None, ret=None):
 
     for idx, output in enumerate(outputs):
         this_path = f"{path}.{idx}" if path else str(idx)
-        if isinstance(output, (tuple, list)):
+        if isinstance(output, (tuple, list)) and any(
+            not isinstance(e, int) for e in output
+        ):
+            # Further flatten the nested list if any element in this list is not
+            # an integer.
             metadata, ret = flatten(output, device, this_path, metadata, ret)
         elif isinstance(output, dict):
             metadata, ret = flatten(output.values(), device, this_path, metadata, ret)
