@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # pylint: disable=logging-fstring-interpolation
 from __future__ import annotations
-
+import ast
 from enum import Enum
+
+import numpy as np
 import torch
 from torch import distributed as dist
 from torch import fx, nn
 
+from ...logger import DEBUG, INFO, get_logger
 from ..registry import register_framework_dialect
-from ...logger import get_logger, DEBUG, INFO
 
 # Change INFO to DEBUG for more verbose logging.
 logger = get_logger("DS-Pipeline", INFO)
@@ -72,9 +74,9 @@ def unwrap_torch_tensor(tensor, desired_type):
     if desired_type == WrappedTypeCode.TORCH_TENSOR:
         return tensor
     if desired_type in [WrappedTypeCode.LIST, WrappedTypeCode.SCALAR]:
-        return tensor.tolist()
+        return [int(e) for e in tensor.tolist()]
     if desired_type == WrappedTypeCode.TUPLE:
-        return tuple(tensor.tolist())
+        return tuple([int(e) for e in tensor.tolist()])
     raise ValueError(f"Unsupported type code {desired_type}")
 
 
@@ -102,12 +104,49 @@ def encode_metadata(metadata):
         [<path>,<type>), (<path>,<type>), ...]
     After encoding: "<path>,<type>|<path>,<type>|..."
     """
-    return "|".join([f"{p},{t}" for p, t in metadata])
+    return "|".join([f"{p};{s};{t}" for p, s, t in metadata])
 
 
 def decode_metadata(metadata_str):
     """Decode metadata from a string."""
-    return [m.split(",") for m in metadata_str.split("|")]
+    ret = [m.split(";") for m in metadata_str.split("|")]
+    for r in ret:
+        r[1] = ast.literal_eval(r[1])
+    return ret
+
+
+# def flatten(outputs, device, path="", metadata=None, ret=None):
+#     """Flatten nested structure of outputs and make sure every
+#     output is a torch.Tensor. We maintain a metadata to restore
+#     the original structure. The metadata format is:
+#         [<path>,<type>), (<path>,<type>), ...]
+#     - <path> is the path to the tensor in the nested structure. For example,
+#      the paths of t1 and t2 in [[t1, t2]] are "0.0" and "0.1". The path of
+#      t1 and t2 in [[t1], [t2]] is "0.0" and "1.0".
+#     - <type> is WrappedTypeCode of the tensor.
+#     Note that len(metadata) == len(ret)
+#     """
+#     metadata = metadata if metadata else []
+#     ret = ret if ret else []
+
+#     for idx, output in enumerate(outputs):
+#         this_path = f"{path}.{idx}" if path else str(idx)
+#         if isinstance(output, (tuple, list)) and any(
+#             not isinstance(e, int) for e in output
+#         ):
+#             # Further flatten the nested list if any element in this list is not
+#             # an integer.
+#             metadata, ret = flatten(output, device, this_path, metadata, ret)
+#         elif isinstance(output, dict):
+#             metadata, ret = flatten(output.values(), device, this_path, metadata, ret)
+#         else:
+#             # The output here could be a torch tensor, a list of integers, or a scalar.
+#             # The latter 2 will be wrapped to a torch.Tensor, so that it can be passed
+#             # to the next stage via nccl.
+#             output, desired_type = wrap_to_torch_tensor(output, device)
+#             ret.append(output)
+#             metadata.append((this_path, desired_type.value))
+#     return metadata, ret
 
 
 def flatten(outputs, device, path="", metadata=None, ret=None):
@@ -122,7 +161,7 @@ def flatten(outputs, device, path="", metadata=None, ret=None):
     Note that len(metadata) == len(ret)
     """
     metadata = metadata if metadata else []
-    ret = ret if ret else []
+    ret = ret if ret else None
 
     for idx, output in enumerate(outputs):
         this_path = f"{path}.{idx}" if path else str(idx)
@@ -135,22 +174,58 @@ def flatten(outputs, device, path="", metadata=None, ret=None):
         elif isinstance(output, dict):
             metadata, ret = flatten(output.values(), device, this_path, metadata, ret)
         else:
-            # The output here could be a torch tensor or scalar.
-            # The latter will be wrapped to a torch.Tensor,
-            # so that it can be passed to the next stage via nccl.
+            # The output here could be a torch tensor, a list of integers, or a scalar.
+            # The latter 2 will be wrapped to a torch.Tensor, so that it can be passed
+            # to the next stage via nccl.
             output, desired_type = wrap_to_torch_tensor(output, device)
-            ret.append(output)
-            metadata.append((this_path, desired_type.value))
+            if ret is None:
+                ret = output.reshape(-1)
+            else:
+                ret = torch.cat([ret, output.reshape(-1)])
+            metadata.append((this_path, str(list(output.shape)), desired_type.value))
     return metadata, ret
+
+
+# def unflatten(args, metadata):
+#     """The reverse function of 'flatten'."""
+#     unordered_args = []
+#     assert len(args) == len(metadata)
+
+#     # Restore nested structure from metadata.
+#     for arg, (path, desired_type) in zip(args, metadata):
+#         prev_ptr = None
+#         curr_ptr = unordered_args
+#         idx = None
+#         for token in path.split("."):
+#             idx = int(token)
+#             while len(curr_ptr) < idx + 1:
+#                 curr_ptr.append([])
+#             prev_ptr = curr_ptr
+#             curr_ptr = curr_ptr[idx]
+#         arg = unwrap_torch_tensor(arg, int(desired_type))
+#         prev_ptr[idx] = arg
+
+#     # Make everything tuple. Since we usually cut pipeline based on layer,
+#     # so the tensors to be packed are usually the layer outputs, which are
+#     # in tuple type. HF models also have some implementations based on tuple
+#     # output, such as "output[:1] + (None,) + output[1:]".
+#     def tupleize(data):
+#         if isinstance(data, (list, tuple)):
+#             return tuple(tupleize(t) for t in data)
+#         return data
+
+#     return tupleize(unordered_args)
 
 
 def unflatten(args, metadata):
     """The reverse function of 'flatten'."""
     unordered_args = []
-    assert len(args) == len(metadata)
+    # assert len(args) == len(metadata)
+    assert len(args) == 1
+    offset_start, offset_end = 0, 0
 
     # Restore nested structure from metadata.
-    for arg, (path, desired_type) in zip(args, metadata):
+    for path, shape, desired_type in metadata:
         prev_ptr = None
         curr_ptr = unordered_args
         idx = None
@@ -160,7 +235,11 @@ def unflatten(args, metadata):
                 curr_ptr.append([])
             prev_ptr = curr_ptr
             curr_ptr = curr_ptr[idx]
-        arg = unwrap_torch_tensor(arg, int(desired_type))
+        offset_end = offset_start + np.prod(shape)
+        arg = unwrap_torch_tensor(
+            args[0][offset_start:offset_end].reshape(*shape), int(desired_type)
+        )
+        offset_start = offset_end
         prev_ptr[idx] = arg
 
     # Make everything tuple. Since we usually cut pipeline based on layer,
@@ -318,13 +397,10 @@ class DeepSpeedPipeStageWrapper(nn.Module):
         metadata, ret = flatten(outputs, device)
         if logger.isEnabledFor(DEBUG):
             logger.debug(f"[{self.name}] Flatten: {len(ret)}; metadata: {metadata}")
-        ret.append(
-            torch.ByteTensor(
-                torch.ByteStorage.from_buffer(bytes(encode_metadata(metadata), "utf8"))
-            ).to(device)
-        )
-        ret = tuple(ret)
-        return ret
+        metadata_buffer = torch.ByteTensor(
+            torch.ByteStorage.from_buffer(bytes(encode_metadata(metadata), "utf8"))
+        ).to(device)
+        return (ret, metadata_buffer)
 
 
 @register_framework_dialect("deepspeed", "pipeline_engine")
