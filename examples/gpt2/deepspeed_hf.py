@@ -136,6 +136,9 @@ def train(args):
 
     loss_fct = ParallelCrossEntropy(group=group)
 
+    # FIXME:
+    enable_pipeline = enable_pipeline and pipeline_cuts
+
     def loss_fn(outputs, labels):
         prediction_scores = outputs
         shifted_prediction_scores = prediction_scores[..., :-1, :].contiguous()
@@ -171,8 +174,8 @@ def train(args):
         if batch_size is None and micro_batch_size is not None:
             batch_size = micro_batch_size * args.world_size
 
-        # if the TP == 1 use zero 3, otherwise use stage-1 optimizer
-        zero_opt_stage = 3 if args.tmp == 1 else 1
+        # if the TP == 1 use zero 3, otherwise use stage-0 optimizer
+        zero_opt_stage = 3 if args.tmp == 1 else 0
         logger.info(f"BS={batch_size}, MBS={micro_batch_size}", ranks=0)
         ds_config_dict = get_ds_config(
             batch_size,
